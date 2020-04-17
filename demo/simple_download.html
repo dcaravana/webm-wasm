@@ -1,0 +1,67 @@
+<!--
+Copyright 2018 Google Inc. All Rights Reserved.
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+<!DOCTYPE html>
+<h1>Simple webm wasm demo</h1>
+<button id="go">Go</button>
+<script>
+  const width = 512;
+  const height = 512;
+  const framerate = 30;
+  const bitrate = 200;
+  const canvas = document.createElement("canvas");
+  [canvas.width, canvas.height] = [width, height];
+  const ctx = canvas.getContext("2d");
+
+  // Returns the next <name> event of `target`.
+  function nextEvent(target, name) {
+    return new Promise(resolve => {
+      target.addEventListener(name, resolve, { once: true });
+    });
+  }
+
+  async function init() {
+    const worker = new Worker("../dist/webm-worker.js");
+    worker.postMessage("./webm-wasm.wasm");
+    await nextEvent(worker, "message");
+
+    worker.postMessage({ timebaseDen: framerate, width, height, bitrate });
+    const gradient = ctx.createLinearGradient(
+      (1 / 4) * width,
+      0,
+      (3 / 4) * width,
+      0
+    );
+    gradient.addColorStop(0, "#000");
+    gradient.addColorStop(1, "#fff");
+    const maxFrames = 2 * framerate;
+    for (let i = 0; i < maxFrames; i++) {
+      ctx.fillStyle = `hsl(${(i * 360) / maxFrames}, 100%, 50%)`;
+      ctx.fillRect(0, 0, width, height);
+      ctx.fillStyle = gradient;
+      ctx.fillRect((1 / 4) * width, (1 / 4) * height, width / 2, height / 2);
+      const imageData = ctx.getImageData(0, 0, width, height);
+      worker.postMessage(imageData.data.buffer, [imageData.data.buffer]);
+    }
+    worker.postMessage(null);
+    const webm = (await nextEvent(worker, "message")).data;
+    const blob = new Blob([webm], { type: "video/webm" });
+    const url = URL.createObjectURL(blob);
+
+    window.location.href = url;
+  }
+
+  document.all.go.onclick = ev => {
+    ev.target.remove();
+    init();
+  };
+</script>

@@ -1,0 +1,136 @@
+<!--
+Copyright 2018 Google Inc. All Rights Reserved.
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+<!DOCTYPE html>
+<h1>Live webm wasm demo</h1>
+<button id="go">Go</button>
+<button id="stop">Stop</button>
+<script src="https://unpkg.com/web-streams-polyfill/dist/polyfill.min.js"></script>
+<script>
+  const framerate = 30;
+  const bitrate = 200;
+  const width = 400;
+  const height = 400;
+  let worker;
+  let streamFromCamera;
+  let buffers = []
+
+  function createBufferURL(buffer, type = '') {
+    return URL.createObjectURL(new Blob([buffer], {type}));
+  }
+
+  function cameraStream({ width, height }) {
+    const video = document.createElement("video");
+    let running = true;
+
+    let s = new ReadableStream({
+      async start(controller) {
+        const cvs = document.createElement("canvas");
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            width: { ideal: width },
+            height: { ideal: height },
+            // frameRate: { ideal: framerate, max: framerate }
+          },
+          audio: false
+        });
+        video.srcObject = stream;
+        video.play();
+        await nextEvent(video, "playing");
+        [cvs.width, cvs.height] = [width, height];
+        const ctx = cvs.getContext("2d");
+        const frameTimeout = 1000 / framerate;
+        setTimeout(async function f() {
+          console.log('frame')
+          ctx.drawImage(video, 0, 0);
+          await controller.enqueue(
+            ctx.getImageData(0, 0, width, height)
+          );
+          if(running) {
+            setTimeout(f, frameTimeout);
+          } else {
+            worker.postMessage(null);
+          }
+        }, frameTimeout);
+      }
+    });
+
+    s.stop = () => {
+      video.pause();
+      running = false;
+
+      const stream = video.srcObject;
+      const tracks = stream.getTracks();
+      tracks.forEach(function(track) {
+        track.stop();
+      });
+      video.srcObject = null;
+    }
+
+    return s
+  }
+
+  // Returns the next <name> event of `target`.
+  function nextEvent(target, name) {
+    return new Promise(resolve => {
+      target.addEventListener(name, resolve, { once: true });
+    });
+  }
+
+  async function init() {
+    worker = new Worker("../dist/webm-worker.js");
+    worker.postMessage("./webm-wasm.wasm");
+    await nextEvent(worker, "message");
+    worker.postMessage({
+      width,
+      height,
+      realtime: true
+    });
+    streamFromCamera = cameraStream({width, height})
+    streamFromCamera.pipeTo(new WritableStream({
+        write(image) {
+          worker.postMessage(image.data.buffer, [image.data.buffer]);
+        }
+      }));
+
+    worker.onmessage = ev => {
+      if(!ev.data) {
+        // let webmBuffer = (await nextEvent(worker, "message")).data;
+        const blob = new Blob(buffers, { type: "video/webm" });
+        const url = URL.createObjectURL(blob);
+        window.location.href = url;
+        return;
+      }
+      buffers.push(ev.data);
+    };
+
+    // WebM not supported on iOS (!?)
+  }
+
+  async function stop() {
+    streamFromCamera.stop();
+
+    // let webmBuffer = (await nextEvent(worker, "message")).data;
+    // const blob = new Blob([webmBuffer], { type: "video/webm" });
+    // const url = URL.createObjectURL(blob);
+    // window.location.href = url;
+  }
+
+  document.all.go.onclick = ev => {
+    ev.target.remove();
+    init();
+  };
+  document.all.stop.onclick = ev => {
+    ev.target.remove();
+    stop();
+  };
+</script>
