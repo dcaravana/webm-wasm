@@ -23,15 +23,59 @@ limitations under the License.
 <script src="https://unpkg.com/event-target-shim/dist/event-target-shim.umd.js"></script>
 
 <script>
+  const {defineEventAttribute} = window.EventTargetShim;
 
-  class WasmMediaRecorder extends EventTarget {
+  // EventTarget cannot be extended in Safari/iOS https://stackoverflow.com/a/58209729/384336
+  class EventDispatcher {
+
+      constructor() {
+          this._listeners = [];
+      }
+
+      hasEventListener(type, listener) {
+          return this._listeners.some(item => item.type === type && item.listener === listener);
+      }
+
+      addEventListener(type, listener) {
+          if (!this.hasEventListener(type, listener)) {
+              this._listeners.push({type, listener, options: {once: false}});
+          }
+          return this
+      }
+
+      removeEventListener(type, listener) {
+          let index = this._listeners.findIndex(item => item.type === type && item.listener === listener);
+          if (index >= 0) this._listeners.splice(index, 1);
+          return this;
+      }
+
+      removeEventListeners() {
+          this._listeners = [];
+          return this;
+      }
+
+      dispatchEvent(evt) {
+          this._listeners
+              .filter(item => item.type === evt.type)
+              .forEach(item => {
+                  const {type, listener, options: {once}} = item;
+                  listener.call(this, evt);
+                  if (once === true) this.removeEventListener(type, listener)
+              });
+          return this
+      }
+  }  
+
+
+  class WasmMediaRecorder extends EventTargetShim /* EventDispatcher */ {
     
     constructor (stream, options = {}, workerOptions = {}) {
       const { mimeType, audioBitsPerSecond, videoBitsPerSecond, bitsPerSecond } = options;
-      const { width, height, realtime } = workerOptions;
+      const { width, height } = workerOptions;
 
       super();
 
+      this._workerOptions = workerOptions;
       this._stream = stream;
       this._state = 'inactive';
       this._mimeType = mimeType || '';
@@ -40,9 +84,7 @@ limitations under the License.
 
       this._width = width;
       this._height = height;
-      this._realtime = realtime;
-      this._framerate = 30;
-      this._bitrate = 200;
+      this._framerate = workerOptions.timebaseDen / workerOptions.timebaseNum;
 
       /** @type {'inactive'|'readyToInit'|'encoding'|'closed'} */
       this.workerState = 'inactive';
@@ -84,6 +126,7 @@ limitations under the License.
     }
 
     async _postMessageToWorker (command, message = {}) {
+      // console.log('_postMessageToWorker', command)
       switch (command) {
         case 'loadEncoder':
           let { mimeType, wasmPath } = message;
@@ -91,14 +134,8 @@ limitations under the License.
           break;
 
         case 'init':
-          let { width, height, realtime } = message;
-
           // Initialize the worker
-          this.worker.postMessage({
-            width: width,
-            height: height,
-            realtime: realtime
-          });
+          this.worker.postMessage(message);
           this.workerState = 'encoding';
           break;
 
@@ -124,13 +161,10 @@ limitations under the License.
     }
 
     _onmessageFromWorker (event) {
+      // console.log('_onmessageFromWorker')
       if(event.data === 'READY') {
 
-        this._postMessageToWorker('init', {
-            width: this._width,
-            height: this._height,
-            realtime: this._realtime
-           });
+        this._postMessageToWorker('init', this._workerOptions);
 
         return;
       }
@@ -230,15 +264,6 @@ limitations under the License.
       // Start recording
       this._state = 'recording';
       this._enableVideoProcessCallback(timeslice);
-
-      // If the worker is already loaded then start
-      if (this.workerState === 'readyToInit') {
-        const { sampleRate, channelCount } = this;
-        this._postMessageToWorker('init',
-                                  { sampleRate,
-                                    channelCount,
-                                    bitsPerSecond: this.audioBitsPerSecond });
-      }
     }
 
     stop () {
@@ -258,6 +283,7 @@ limitations under the License.
     }
 
     requestData () {
+      console.log('requestData');
       const blob = new Blob(this._buffers, { type: "video/webm" });
       this._buffers = []
 
@@ -287,7 +313,7 @@ limitations under the License.
     'pause', // Called to handle the pause event.
     'resume', // Called to handle the resume event.
     'error' // Called to handle a MediaRecorderErrorEvent.
-  ].forEach(name => EventTargetShim.defineEventAttribute(WasmMediaRecorder.prototype, name));
+  ].forEach(name => defineEventAttribute(WasmMediaRecorder.prototype, name));
 
 
   window.MediaRecorder = WasmMediaRecorder;
@@ -295,17 +321,35 @@ limitations under the License.
   let recorder;
 
   function startRecording () {
-    navigator.mediaDevices.getUserMedia({ video: true }).then(stream => {
+    let config = {
+      width: 300,
+      height: 150,
+      timebaseNum: 1,
+      timebaseDen: 15,
+      bitrate: 100,
+      realtime: true
+    };
+
+    navigator.mediaDevices.getUserMedia({
+      video: {
+        width: { ideal: config.width },
+        height: { ideal: config.height },
+        // frameRate: { ideal: framerate, max: framerate }
+      },
+      audio: false
+    }).then(stream => {
       let options = { mimeType: 'video/webm' };
 
-      recorder = new MediaRecorder(stream, options, {width: 400, height: 400, realtime: true});  // ,workerOptions
+      recorder = new MediaRecorder(stream, options, config);
       recorder.start();
 
       recorder.addEventListener('dataavailable', (e) => {
+        alert('complete!')
         let url = URL.createObjectURL(e.data);
-        document.all.videoElement.src = url;
         document.all.downloadElement.href = url;
         // window.location.href = url;
+        document.all.videoElement.src = url;
+        alert('ready!')
       });
     });
   }
@@ -315,6 +359,7 @@ limitations under the License.
     startRecording();
   };
   document.all.stop_mr.onclick = ev => {
+    ev.target.remove();
     recorder.stop();
     recorder.stream.getTracks().forEach(i => i.stop());
   };
