@@ -1,0 +1,322 @@
+<!--
+Copyright 2018 Google Inc. All Rights Reserved.
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+<!DOCTYPE html>
+<h1>Live webm wasm demo</h1>
+
+<button id="go_mr">Go MR</button>
+<button id="stop_mr">Stop MR</button>
+
+<video id="videoElement" controls></video>
+<a id="downloadElement" download="test.webm">download</a>
+
+<script src="https://unpkg.com/web-streams-polyfill/dist/polyfill.min.js"></script>
+<script src="https://unpkg.com/event-target-shim/dist/event-target-shim.umd.js"></script>
+
+<script>
+
+  class WasmMediaRecorder extends EventTarget {
+    
+    constructor (stream, options = {}, workerOptions = {}) {
+      const { mimeType, audioBitsPerSecond, videoBitsPerSecond, bitsPerSecond } = options;
+      const { width, height, realtime } = workerOptions;
+
+      super();
+
+      this._stream = stream;
+      this._state = 'inactive';
+      this._mimeType = mimeType || '';
+      this._videoBitsPerSecond = videoBitsPerSecond || bitsPerSecond;
+      // this._audioBitsPerSecond = audioBitsPerSecond || bitsPerSecond;
+
+      this._width = width;
+      this._height = height;
+      this._realtime = realtime;
+      this._framerate = 30;
+      this._bitrate = 200;
+
+      /** @type {'inactive'|'readyToInit'|'encoding'|'closed'} */
+      this.workerState = 'inactive';
+      this._wasmPath = "./webm-wasm.wasm";
+      this._buffers = []
+    }
+
+    get stream () {
+      return this._stream;
+    }
+
+    get mimeType () {
+      return this._mimeType;
+    }
+
+    get state () {
+      return this._state;
+    }
+
+    get videoBitsPerSecond () {
+      return this._videoBitsPerSecond;
+    }
+
+    get audioBitsPerSecond () {
+      return undefined;
+    }
+
+    _spawnWorker () {
+      this.worker = new Worker("../dist/webm-worker.js");
+
+      this.worker.onmessage = (e) => this._onmessageFromWorker(e);
+      // this.worker.onerror = (e) => this._onerrorFromWorker(e);
+
+      this._postMessageToWorker('loadEncoder',
+                                { mimeType: this._mimeType,
+                                  wasmPath: this._wasmPath });
+
+                                  
+    }
+
+    async _postMessageToWorker (command, message = {}) {
+      switch (command) {
+        case 'loadEncoder':
+          let { mimeType, wasmPath } = message;
+          this.worker.postMessage(wasmPath);
+          break;
+
+        case 'init':
+          let { width, height, realtime } = message;
+
+          // Initialize the worker
+          this.worker.postMessage({
+            width: width,
+            height: height,
+            realtime: realtime
+          });
+          this.workerState = 'encoding';
+          break;
+
+        case 'pushInputData':
+          
+          let { image } = message;
+          this.worker.postMessage(image.data.buffer, [image.data.buffer]);
+          break;
+
+        case 'getEncodedData':
+          // Request encoded result.
+          // Expected 'encodedData' event from the worker
+          // this.worker.postMessage({ command });
+          break;
+
+        case 'done':
+          // Tell encoder finallize the job and destory itself.
+          // Expected 'lastEncodedData' event from the worker.
+          // this.worker.postMessage({ command });
+          break;
+
+      }
+    }
+
+    _onmessageFromWorker (event) {
+      if(event.data === 'READY') {
+
+        this._postMessageToWorker('init', {
+            width: this._width,
+            height: this._height,
+            realtime: this._realtime
+           });
+
+        return;
+      }
+
+      // TODO how to distinguish between different messages?
+      if(!event.data) {
+        const blob = new Blob(this._buffers, { type: "video/webm" });
+
+        let eventToPush = new Event('dataavailable');
+        eventToPush.data = blob;
+        this.dispatchEvent(eventToPush);
+
+        eventToPush = new Event('stop');
+        this.workerState = 'closed';
+
+        this._buffers = []
+        return;
+      }
+
+      this._buffers.push(event.data);
+    }
+
+    _internalCameraStream() {
+      const video = document.createElement("video");
+      let running = true;
+      let mediaRecorder = this;
+      let framerate = this._framerate;
+      let width = this._width;
+      let height = this._height;
+      
+
+      let s = new ReadableStream({
+        async start(controller) {
+          const cvs = document.createElement("canvas");
+          video.srcObject = mediaRecorder.stream;
+          video.play();
+          await WasmMediaRecorder._nextEvent(video, "playing");
+          [cvs.width, cvs.height] = [width, height];
+          const ctx = cvs.getContext("2d");
+          const frameTimeout = 1000 / framerate;
+          setTimeout(async function f() {
+            // console.log('frame')
+            ctx.drawImage(video, 0, 0);
+            await controller.enqueue(
+              ctx.getImageData(0, 0, width, height)
+            );
+            if(running) {
+              setTimeout(f, frameTimeout);
+            } else {
+              mediaRecorder.worker.postMessage(null);
+            }
+          }, frameTimeout);
+        }
+      });
+
+      s.stop = () => {
+        video.pause();
+        running = false;
+
+        const vstream = video.srcObject;
+        const tracks = vstream.getTracks();
+        tracks.forEach(function(track) {
+          track.stop();
+        });
+        video.srcObject = null;
+      }
+
+      return s
+    }
+
+    // TODO implement timeslice
+    _enableVideoProcessCallback (timeslice) {
+      let mediaRecorder = this;
+
+      this._internalStream = this._internalCameraStream();
+      this._internalStream.pipeTo(new WritableStream({
+        write(image) {
+          mediaRecorder._postMessageToWorker('pushInputData', { image: image });
+        }
+      }));
+    }
+
+    start (timeslice = Number.MAX_SAFE_INTEGER) {
+      if (this.state !== 'inactive') {
+        throw new Error('DOMException: INVALID_STATE_ERR, state must be inactive.');
+      }
+      if (timeslice < 0) {
+        throw new TypeError('invalid arguments, timeslice should be 0 or higher.');
+      }
+      timeslice /= 1000; // Convert milliseconds to seconds
+
+      // Check worker is closed (usually by stop()) and init.
+      if (this.workerState === 'inactive' || this.workerState === 'closed') {
+        this._spawnWorker();
+      }
+
+      // Start recording
+      this._state = 'recording';
+      this._enableVideoProcessCallback(timeslice);
+
+      // If the worker is already loaded then start
+      if (this.workerState === 'readyToInit') {
+        const { sampleRate, channelCount } = this;
+        this._postMessageToWorker('init',
+                                  { sampleRate,
+                                    channelCount,
+                                    bitsPerSecond: this.audioBitsPerSecond });
+      }
+    }
+
+    stop () {
+      if (this.state === 'inactive') {
+        throw new Error('DOMException: INVALID_STATE_ERR, state must NOT be inactive.');
+      }
+
+      this._internalStream.stop();
+      this._state = 'inactive';      
+    }
+
+    pause () {
+      console.log('not implemented: pause')
+    }
+    resume () {
+      console.log('not implemented: resume')
+    }
+
+    requestData () {
+      const blob = new Blob(this._buffers, { type: "video/webm" });
+      this._buffers = []
+
+      let eventToPush = new Event('dataavailable');
+      eventToPush.data = blob;
+      this.dispatchEvent(eventToPush);
+    }
+
+    static isTypeSupported (mimeType) {
+      return true
+    }
+
+    static _nextEvent(target, name) {
+      return new Promise(resolve => {
+        target.addEventListener(name, resolve, { once: true });
+      });
+    }
+
+  }
+
+  [
+    'start', // Called to handle the {@link MediaRecorder#start} event.
+    'stop', // Called to handle the stop event.
+    'dataavailable', /* Called to handle the dataavailable event. The Blob of
+                          recorded data is contained in this event and can be
+                          accessed via its data attribute. */
+    'pause', // Called to handle the pause event.
+    'resume', // Called to handle the resume event.
+    'error' // Called to handle a MediaRecorderErrorEvent.
+  ].forEach(name => EventTargetShim.defineEventAttribute(WasmMediaRecorder.prototype, name));
+
+
+  window.MediaRecorder = WasmMediaRecorder;
+
+  let recorder;
+
+  function startRecording () {
+    navigator.mediaDevices.getUserMedia({ video: true }).then(stream => {
+      let options = { mimeType: 'video/webm' };
+
+      recorder = new MediaRecorder(stream, options, {width: 400, height: 400, realtime: true});  // ,workerOptions
+      recorder.start();
+
+      recorder.addEventListener('dataavailable', (e) => {
+        let url = URL.createObjectURL(e.data);
+        document.all.videoElement.src = url;
+        document.all.downloadElement.href = url;
+        // window.location.href = url;
+      });
+    });
+  }
+
+  document.all.go_mr.onclick = ev => {
+    ev.target.remove();
+    startRecording();
+  };
+  document.all.stop_mr.onclick = ev => {
+    recorder.stop();
+    recorder.stream.getTracks().forEach(i => i.stop());
+  };
+
+</script>
