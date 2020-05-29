@@ -189,6 +189,8 @@ limitations under the License.
 
     _internalCameraStream() {
       const video = document.createElement("video");
+      video.setAttribute("muted", "");
+      video.setAttribute("playsinline", "");
       let running = true;
       let mediaRecorder = this;
       let framerate = this._framerate;
